@@ -233,6 +233,17 @@ function getJsonPath(rootData: any, currentNode: any, paths: string[], modelMana
     return withPath.length > 0 ? `$${withPath.join('')}` : '$';
 }
 
+/**
+ * Prefixes a JSON path that is relative to a nested data context (a list item or an
+ * optional object) with the absolute path of that context in the template data.
+ * @param {string} dataPath the absolute JSON path of the current data context, e.g. "$['parties'][0]"
+ * @param {string} relativePath a JSON path relative to the current data context, e.g. "$['name']"
+ * @returns {string} the absolute JSON path, e.g. "$['parties'][0]['name']"
+ */
+function toAbsolutePath(dataPath: string, relativePath: string): string {
+    return `${dataPath}${relativePath.slice(1)}`;
+}
+
 // the key is a path[] joined with '/' from the traverse library
 // the value is the evaluation result
 type UserCodeResult = Record<string, any>;
@@ -294,7 +305,7 @@ type OptionalBlockResult = Record<string, any[]>;
  * @param {[GenerationOptions]} options - the generation options
  * @returns {*} the AgreementMark JSON for optional blocks
  */
-async function generateOptionalBlocks(modelManager: ModelManager, clauseLibrary: object, templateMark: object, data: TemplateData, userLogic: CompiledUserLogic | undefined, options?: GenerationOptions): Promise<OptionalBlockResult> {
+async function generateOptionalBlocks(modelManager: ModelManager, clauseLibrary: object, templateMark: object, data: TemplateData, userLogic: CompiledUserLogic | undefined, options: GenerationOptions | undefined, dataPath: string): Promise<OptionalBlockResult> {
     const result: OptionalBlockResult = {};
     const paths = traverse(templateMark).paths();
     for (let n = 0; n < paths.length; n++) {
@@ -327,7 +338,7 @@ async function generateOptionalBlocks(modelManager: ModelManager, clauseLibrary:
                             nodes: context.whenSome
                         };
                         // Process with the optional property value as the new data context
-                        const subResult = await generateAgreement(modelManager, clauseLibrary, whenSomeParagraph, optionalPropertyValue, userLogic, options);
+                        const subResult = await generateAgreement(modelManager, clauseLibrary, whenSomeParagraph, optionalPropertyValue, userLogic, options, toAbsolutePath(dataPath, path));
                         result[thisPath.join('/')] = subResult.nodes ? subResult.nodes : [];
                     } else {
                         result[thisPath.join('/')] = [];
@@ -353,7 +364,7 @@ async function generateOptionalBlocks(modelManager: ModelManager, clauseLibrary:
  * @param {[GenerationOptions]} options - the generation options
  * @returns {*} the AgreementMark JSON for the list block
  */
-async function generateRecursiveBlocks(modelManager: ModelManager, clauseLibrary: object, templateMark: object, data: TemplateData, nodeRegExp: RegExp, childNodeClass: string, userLogic: CompiledUserLogic | undefined, options?: GenerationOptions): Promise<RecursiveBlockResult> {
+async function generateRecursiveBlocks(modelManager: ModelManager, clauseLibrary: object, templateMark: object, data: TemplateData, nodeRegExp: RegExp, childNodeClass: string, userLogic: CompiledUserLogic | undefined, options: GenerationOptions | undefined, dataPath: string): Promise<RecursiveBlockResult> {
     const result: RecursiveBlockResult = {};
     const paths = traverse(templateMark).paths();
     for (let n = 0; n < paths.length; n++) {
@@ -401,7 +412,7 @@ async function generateRecursiveBlocks(modelManager: ModelManager, clauseLibrary
                         for (let n = 0; n < arrayData.length; n++) {
                             const arrayItem = arrayData[n];
                             // arrayItem is now the data for the nested generation
-                            const subResult = await generateAgreement(modelManager, clauseLibrary, itemTemplate, arrayItem, userLogic, options);
+                            const subResult = await generateAgreement(modelManager, clauseLibrary, itemTemplate, arrayItem, userLogic, options, `${toAbsolutePath(dataPath, path)}[${n}]`);
                             // Unwrap the processed Item, including a synthetic multi-block
                             // container, so the output never gains an extra Item layer.
                             // Otherwise the processed block itself becomes the sole child of
@@ -432,15 +443,15 @@ async function generateRecursiveBlocks(modelManager: ModelManager, clauseLibrary
  * @param {[GenerationOptions]} options - the generation options
  * @returns {*} the AgreementMark JSON
  */
-async function generateAgreement(modelManager: ModelManager, clauseLibrary: object, templateMark: object, data: TemplateData, userLogic: CompiledUserLogic | undefined, options?: GenerationOptions): Promise<any> {
+async function generateAgreement(modelManager: ModelManager, clauseLibrary: object, templateMark: object, data: TemplateData, userLogic: CompiledUserLogic | undefined, options?: GenerationOptions, dataPath = '$'): Promise<any> {
     const introspector = new Introspector(modelManager);
     // evaluate all the user code (async)
     const userCodeResults = await evaluateUserCode(clauseLibrary, templateMark, data, userLogic, options);
     // evaluate all recursive blocks (async)
-    const listBlockResults = await generateRecursiveBlocks(modelManager, clauseLibrary, templateMark, data, LISTBLOCK_DEFINITION_RE, `${CommonMarkModel.NAMESPACE}.Item`, userLogic, options);
-    const foreachBlockResults = await generateRecursiveBlocks(modelManager, clauseLibrary, templateMark, data, FOREACH_DEFINITION_RE, `${CommonMarkModel.NAMESPACE}.Paragraph`, userLogic, options);
+    const listBlockResults = await generateRecursiveBlocks(modelManager, clauseLibrary, templateMark, data, LISTBLOCK_DEFINITION_RE, `${CommonMarkModel.NAMESPACE}.Item`, userLogic, options, dataPath);
+    const foreachBlockResults = await generateRecursiveBlocks(modelManager, clauseLibrary, templateMark, data, FOREACH_DEFINITION_RE, `${CommonMarkModel.NAMESPACE}.Paragraph`, userLogic, options, dataPath);
     // evaluate all optional blocks (async)
-    const optionalBlockResults = await generateOptionalBlocks(modelManager, clauseLibrary, templateMark, data, userLogic, options);
+    const optionalBlockResults = await generateOptionalBlocks(modelManager, clauseLibrary, templateMark, data, userLogic, options, dataPath);
     // traverse the templatemark, creating an output agreementmark tree
     return traverse(templateMark).map(function (context: any) {
         let stopHere = false;
@@ -562,6 +573,9 @@ async function generateAgreement(modelManager: ModelManager, clauseLibrary: obje
                         // we want to draft Enums as strings, not objects
                         const drafter = getDrafter(type && type.isEnum() ? 'String' : context.elementType);
                         context.value = drafter ? drafter(variableValue, context.format) : JSON.stringify(variableValue) as string;
+                        // record where the value came from, so that variables sharing a name
+                        // (e.g. {{partyId}} under both licensee and licensor) stay distinct
+                        context.path = toAbsolutePath(dataPath, path);
                     }
                 }
                 else {
@@ -571,6 +585,8 @@ async function generateAgreement(modelManager: ModelManager, clauseLibrary: obje
                     // we want to draft Enums as strings, not objects
                     const drafter = getDrafter(type && type.isEnum() ? 'String' : context.elementType);
                     context.value = drafter ? drafter(variableValue, context.format) : JSON.stringify(variableValue) as string;
+                    // the list item itself is the value
+                    context.path = dataPath;
                 }
             }
 
